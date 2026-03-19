@@ -6,8 +6,9 @@ Rust learning project that extracts `.onion` addresses from Common Crawl WARC ar
 
 ```sh
 cargo build              # compile
-cargo run                # run with default warc.paths
-cargo run -- <file>      # run with custom input file
+cargo run                # download 1 archive (default)
+cargo run -- --limit 3   # download up to 3 archives
+cargo run -- --limit 2 custom.paths  # custom paths file
 ```
 
 ## Constraints
@@ -18,12 +19,13 @@ cargo run -- <file>      # run with custom input file
 
 ## Current State
 
-Step 1 complete: reads `warc.paths` line by line, prints each path with line number.
+Step 2 complete: downloads WARC archives from Common Crawl over HTTP with streaming I/O,
+skip-if-exists logic, `--limit N` flag, and progress display. Uses `ureq` (blocking HTTP).
 
 ## Roadmap
 
 1. ~~Project scaffolding — read WARC paths file~~ (done)
-2. HTTP download of a single WARC file
+2. ~~HTTP download of WARC archives~~ (done)
 3. Gzip decompression + WARC record parsing
 4. Regex extraction of `.onion` addresses
 5. Deduplication and output formatting
