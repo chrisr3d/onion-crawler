@@ -125,3 +125,98 @@ This is a common Rust pattern — explicit bindings make lifetimes clear.
 
 Step 3: Decompress the downloaded `.warc.gz` files and parse WARC records to extract
 their content for further processing.
+
+---
+
+## Steps 3–5: WARC Parsing, .onion Extraction, and Deduplication
+
+### What we built
+
+A complete processing pipeline that decompresses WARC archives, scans for `.onion`
+addresses using regex, deduplicates results, and persists them to JSON. The program now
+implements a three-state model for each archive:
+
+1. **Already processed** (in `output/processed.log`) → skip entirely
+2. **Downloaded but not parsed** (file exists in `download/`) → parse it
+3. **Not downloaded** → download first, then parse
+
+Results are stored in `output/onions.json` as a map from each `.onion` address to the
+list of archives it was found in. A `--delete` flag optionally removes archives after
+parsing to save disk space.
+
+### Rust concepts introduced
+
+**`HashMap<K, V>` — key-value hash table**
+Rust's standard hash map provides O(1) average-case lookup and insertion. We use
+`HashMap<String, Vec<String>>` to map each `.onion` address to its source archives.
+The `entry().or_default()` pattern is the idiomatic way to do "get-or-insert" — it
+avoids a double lookup (one to check existence, one to insert).
+
+**`HashSet<T>` — unique membership collection**
+`HashSet` stores unique values with O(1) average-case lookup via hashing. We use it
+in two places: to track already-processed filenames (skip-if-processed logic), and for
+per-archive deduplication of `.onion` addresses during parsing.
+
+**The `warc` crate — structured WARC parsing**
+Instead of raw byte scanning with `flate2` + `read_until`, we use the `warc` crate
+which understands the WARC archive format. `WarcReader::from_path_gzip` handles gzip
+decompression internally and parses record boundaries, headers, and bodies. Each record
+is yielded as a typed struct with a `warc_type()` (Response, Request, Metadata, etc.)
+and a `body()` payload. By filtering to only `RecordType::Response`, we skip binary
+content, request records, and metadata — processing ~30–50% of the data instead of 100%.
+
+**`RecordType` enum — WARC record types**
+WARC records are typed: Response (HTTP response bodies), Request (HTTP requests),
+Metadata, WarcInfo, etc. Only Response records contain the HTML/JS content where
+`.onion` links appear. Pattern matching on the enum lets us skip everything else.
+
+**Why structured parsing beats raw scanning**
+The previous approach decompressed every byte and scanned it through regex — including
+binary content (images, fonts) that produced multi-megabyte "lines" with no newlines.
+Working at the right abstraction level (WARC records instead of raw bytes) is a general
+performance lesson: when data has structure, use it.
+
+**`Regex` compilation and `find_iter` — pattern matching**
+`Regex::new()` compiles a pattern string into an efficient automaton. This compilation
+is expensive, so we do it once outside the loop. `find_iter()` returns an iterator of
+all non-overlapping matches in a string, which we use to scan each line for `.onion`
+patterns. Our regex matches both v2 (16-char) and v3 (56-char) onion addresses using
+base32 character classes.
+
+**`serde_json` — JSON serialization without derive macros**
+`serde_json::to_string_pretty` serializes any type that implements serde's `Serialize`
+trait. Standard library types like `HashMap`, `Vec`, and `String` get this automatically
+through blanket implementations — no `#[derive(Serialize)]` needed.
+
+**`OpenOptions` — fine-grained file opening**
+Unlike `File::create` (which truncates) or `File::open` (read-only), `OpenOptions`
+lets us combine flags: `.append(true)` positions writes at the end (like `>>` in shell),
+`.create(true)` creates the file if it doesn't exist. We use this for the processed log
+so we never lose previously logged entries.
+
+**`Cow<str>` via `String::from_utf8_lossy` — zero-cost when possible**
+`from_utf8_lossy` returns `Cow<str>` (Copy-on-Write). If the input bytes are valid
+UTF-8 (the common case), it borrows the original data with no allocation. If bytes
+contain invalid sequences, it allocates a new String with U+FFFD replacement characters.
+We use this to convert WARC response bodies (which are `&[u8]`) to strings for regex
+scanning.
+
+### Correctness fixes applied later
+
+**Duplicate archive names in results** — The original `results.entry(onion).or_default().push()`
+blindly appended the archive filename. If an archive was reprocessed (interrupted run, manual
+re-run), the same filename would appear multiple times. Fixed with `Vec::contains` before
+inserting. We chose `Vec::contains` (linear scan) over `HashSet` because the lists are tiny
+(1–5 entries per onion) — for small N, a linear scan beats the hashing overhead, and `Vec`
+preserves insertion order for stable JSON output.
+
+**Incremental result persistence** — Originally, `save_results` ran once after the loop while
+`mark_processed` ran per-archive. A crash between the two could cause results and processed
+state to diverge. Now both run per-archive: if either fails, the next run reprocesses that
+archive (safe, just redundant). The final `save_results` after the loop remains as a safety
+net. This "save after each unit of work" pattern is standard for batch jobs where interruption
+is expected.
+
+### What's next
+
+Step 6: Concurrent downloads and processing with async/tokio.

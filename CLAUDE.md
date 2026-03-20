@@ -6,9 +6,10 @@ Rust learning project that extracts `.onion` addresses from Common Crawl WARC ar
 
 ```sh
 cargo build              # compile
-cargo run                # download 1 archive (default)
-cargo run -- --limit 3   # download up to 3 archives
-cargo run -- --limit 2 custom.paths  # custom paths file
+cargo run                # download & parse 1 archive (default)
+cargo run -- --limit 3   # process up to 3 archives
+cargo run -- --delete    # delete archive after parsing
+cargo run -- --limit 3 --delete custom.paths  # combined
 ```
 
 ## Constraints
@@ -19,14 +20,18 @@ cargo run -- --limit 2 custom.paths  # custom paths file
 
 ## Current State
 
-Step 2 complete: downloads WARC archives from Common Crawl over HTTP with streaming I/O,
-skip-if-exists logic, `--limit N` flag, and progress display. Uses `ureq` (blocking HTTP).
+Steps 1–5 complete: sequential pipeline from reading WARC paths → HTTP downloads (ureq)
+→ WARC parsing → `.onion` regex extraction → deduplication → JSON output. Three-state
+processing model (processed → skip, downloaded → parse, missing → download + parse).
+Results stored in `output/onions.json`, processing state tracked in
+`output/processed.log`. Uses `ureq` (blocking HTTP), `warc` (structured WARC parsing),
+`regex`, `serde_json`.
 
 ## Roadmap
 
 1. ~~Project scaffolding — read WARC paths file~~ (done)
 2. ~~HTTP download of WARC archives~~ (done)
-3. Gzip decompression + WARC record parsing
-4. Regex extraction of `.onion` addresses
-5. Deduplication and output formatting
+3. ~~Gzip decompression + WARC record parsing~~ (done)
+4. ~~Regex extraction of `.onion` addresses~~ (done)
+5. ~~Deduplication and output formatting~~ (done)
 6. Concurrent downloads with async/tokio

@@ -1,63 +1,73 @@
-// onion-crawler — Step 2: Download WARC archives from Common Crawl
+// onion-crawler — Steps 3–5: WARC Parsing, .onion Extraction, and Deduplication
 //
-// Reads a list of WARC archive paths, then downloads each one over HTTP.
-// Archives are streamed to disk (never loaded entirely into memory) with
-// progress output. Already-downloaded files are skipped automatically.
+// Building on Step 2's HTTP downloader, the pipeline now:
+//   1. Downloads WARC archives from Common Crawl (using ureq)
+//   2. Decompresses and parses them with the `warc` crate
+//   3. Extracts .onion addresses via regex
+//   4. Deduplicates results and persists them to JSON
 //
-// New concepts in this step: external crates, Box<dyn Error>, the ? operator,
-// Path/PathBuf, fs::create_dir_all, impl Trait parameters, Read/Write traits,
-// iterator .take(), and str::parse::<T>().
+// The program implements a three-state model for each archive:
+//   - Already processed (in output/processed.log) → skip entirely
+//   - Downloaded but not parsed (file exists in download/) → parse it
+//   - Not downloaded → download first, then parse
+//
+// New concepts: HashMap, HashSet, OpenOptions, warc crate, regex, serde_json.
 
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::error::Error;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
-use std::time::Duration;
+
+use regex::Regex;
+use warc::{RecordType, WarcReader};
 
 /// Base URL for Common Crawl data archives.
 const COMMONCRAWL_BASE: &str = "https://data.commoncrawl.org/";
 
-/// Default number of archives to download per run.
+/// Default number of archives to process per run.
 const DEFAULT_LIMIT: usize = 1;
+
+/// File tracking which archives have been fully processed.
+const PROCESSED_FILE: &str = "output/processed.log";
+
+/// JSON file storing extracted .onion addresses and their source archives.
+const RESULTS_FILE: &str = "output/onions.json";
 
 // ---------------------------------------------------------------------------
 // CLI Argument Parsing
 // ---------------------------------------------------------------------------
 
-/// Parse command-line arguments into (paths_file, limit).
+/// Parsed command-line configuration.
+struct Config {
+    paths_file: String,
+    limit: usize,
+    delete: bool,
+}
+
+/// Parse command-line arguments into a `Config`.
 ///
 /// Supports:
-///   --limit N       or  --limit=N   → cap how many files to download
-///   <positional>                     → path to the WARC-paths file
-///
-/// Returns a tuple — Rust functions can return multiple values this way.
-/// `String` is an owned, heap-allocated string; `usize` is an unsigned
-/// pointer-sized integer (ideal for counts and indices).
-fn parse_args() -> (String, usize) {
-    // `env::args()` returns an iterator of Strings. `.skip(1)` drops the
-    // program name (argv[0]). `.collect()` consumes the iterator into a Vec.
+///   --limit N / --limit=N  → cap how many archives to process
+///   --delete               → remove archive files after parsing
+///   <positional>           → path to the WARC-paths file
+fn parse_args() -> Config {
     let args: Vec<String> = env::args().skip(1).collect();
 
     let mut paths_file = String::from("warc.paths");
     let mut limit = DEFAULT_LIMIT;
+    let mut delete = false;
 
-    // We walk through args with an index so we can peek ahead for `--limit N`.
     let mut i = 0;
     while i < args.len() {
-        // `str::strip_prefix` returns Option<&str> — the remainder after the
-        // prefix, or None if the string doesn't start with it.
         if let Some(value) = args[i].strip_prefix("--limit=") {
-            // `str::parse::<usize>()` tries to convert a string to a number.
-            // It returns Result<usize, ParseIntError>. We handle the error
-            // with `unwrap_or_else` to give a clear message.
             limit = value.parse::<usize>().unwrap_or_else(|_| {
                 eprintln!("Error: --limit value '{}' is not a valid number", value);
                 process::exit(1);
             });
         } else if args[i] == "--limit" {
-            // `--limit N` form: the value is in the next argument.
             i += 1;
             if i >= args.len() {
                 eprintln!("Error: --limit requires a value");
@@ -67,168 +77,147 @@ fn parse_args() -> (String, usize) {
                 eprintln!("Error: --limit value '{}' is not a valid number", args[i]);
                 process::exit(1);
             });
+        } else if args[i] == "--delete" {
+            delete = true;
         } else if args[i].starts_with('-') {
             eprintln!("Error: unknown flag '{}'", args[i]);
             process::exit(1);
         } else {
-            // Positional argument — treat as the paths file.
-            // `.clone()` creates an owned copy of the String.
             paths_file = args[i].clone();
         }
         i += 1;
     }
 
-    (paths_file, limit)
+    Config {
+        paths_file,
+        limit,
+        delete,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State Management
+// ---------------------------------------------------------------------------
+
+/// Load the set of already-processed archive filenames.
+///
+/// `HashSet` stores unique values with O(1) average-case lookup via hashing.
+/// It's the right tool when the core question is "have we seen this before?"
+fn load_processed() -> HashSet<String> {
+    let path = Path::new(PROCESSED_FILE);
+    if !path.exists() {
+        return HashSet::new();
+    }
+
+    let content = fs::read_to_string(path).unwrap_or_default();
+    content
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Append a filename to the processed log.
+fn mark_processed(filename: &str) -> io::Result<()> {
+    fs::create_dir_all("output")?;
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(PROCESSED_FILE)?;
+    writeln!(file, "{}", filename)
+}
+
+/// Load existing results from the JSON file.
+fn load_results() -> HashMap<String, Vec<String>> {
+    let path = Path::new(RESULTS_FILE);
+    if !path.exists() {
+        return HashMap::new();
+    }
+
+    let content = fs::read_to_string(path).unwrap_or_default();
+    serde_json::from_str(&content).unwrap_or_default()
+}
+
+/// Save the results map to the JSON file.
+fn save_results(results: &HashMap<String, Vec<String>>) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all("output")?;
+    let json = serde_json::to_string_pretty(results)?;
+    fs::write(RESULTS_FILE, json)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Download Logic
 // ---------------------------------------------------------------------------
 
-/// Download a single WARC archive from Common Crawl.
+/// Extract the filename component from a WARC URI path.
 ///
-/// `uri` is the relative path from `warc.paths` (e.g.
-/// `crawl-data/CC-NEWS/2025/10/CC-NEWS-20251001002341-04358.warc.gz`).
-///
-/// ## Return type: `Result<(), Box<dyn Error>>`
-///
-/// `Box<dyn Error>` is a *trait object* — a heap-allocated value that
-/// implements the `Error` trait. This lets the function return *any* error
-/// type (io::Error, ureq::Error, etc.) without the caller needing to know
-/// which concrete type it is. The `?` operator converts compatible errors
-/// automatically.
-/// Returns `Ok(true)` if a file was actually downloaded, `Ok(false)` if
-/// it was skipped because it already exists on disk.
-fn download_warc(uri: &str) -> Result<bool, Box<dyn Error>> {
-    // --- Build the full URL ---
-    let url = format!("{}{}", COMMONCRAWL_BASE, uri);
-
-    // --- Extract the filename ---
-    // `rsplit('/')` splits from the right; `.next()` gives the last segment.
-    // `ok_or("...")` converts Option → Result, so we can use `?`.
-    let filename = uri
-        .rsplit('/')
+/// e.g. `crawl-data/CC-NEWS/.../CC-NEWS-20251001.warc.gz` → `CC-NEWS-20251001.warc.gz`
+fn filename_from_uri(uri: &str) -> Result<&str, &'static str> {
+    uri.rsplit('/')
         .next()
-        .ok_or("URI has no filename component")?;
+        .ok_or("URI has no filename component")
+}
 
-    // --- Build local path ---
-    // `Path` is a borrowed path slice (like &str for file paths).
-    // `PathBuf` is the owned version (like String). `.join()` appends
-    // a component with the correct OS separator.
+/// Download a single WARC archive from Common Crawl using `ureq`.
+///
+/// Streams the response body to disk in 8 KB chunks (via `Read` trait),
+/// so memory usage stays constant regardless of archive size. Prints
+/// progress every 10 MB.
+fn download_warc(uri: &str) -> Result<bool, Box<dyn Error>> {
+    let url = format!("{}{}", COMMONCRAWL_BASE, uri);
+    let filename = filename_from_uri(uri)?;
     let local_path: PathBuf = Path::new("download").join(filename);
 
-    // --- Skip if already downloaded ---
     if local_path.exists() {
-        eprintln!("  Skipping {} (already exists)", filename);
+        eprintln!("  [{}] Already downloaded, skipping download", filename);
         return Ok(false);
     }
 
-    // --- Create download directory ---
-    // `create_dir_all` is like `mkdir -p`: creates the directory and all
-    // parent directories if they don't exist. Succeeds silently if the
-    // directory is already there.
     fs::create_dir_all("download")?;
 
-    eprintln!("  Downloading {}", filename);
-    eprintln!("  URL: {}", url);
+    eprintln!("  [{}] Downloading...", filename);
+    eprintln!("  [{}] URL: {}", filename, url);
 
-    // --- Build an HTTP agent with appropriate timeouts ---
-    // `ureq::Agent` is a connection pool + configuration bundle.
-    // We disable the global timeout (which would cap the entire transfer)
-    // but keep a connect timeout so we fail fast on unreachable hosts.
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(None)
-        .timeout_connect(Some(Duration::from_secs(30)))
-        .build()
-        .new_agent();
+    let response = ureq::get(&url).call()?;
 
-    // --- Make the HTTP GET request ---
-    // `.call()` sends the request and returns the response. The `?` operator
-    // propagates any error (DNS failure, timeout, HTTP 4xx/5xx) to our caller.
-    let response = agent.get(&url).call()?;
-
-    // --- Read Content-Length for progress display ---
-    // The server may or may not include this header. We use Option<u64>.
-    let total_size = response.body().content_length();
+    // Content-Length header tells us the total size (if the server provides it).
+    let total_size: Option<u64> = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok());
 
     if let Some(size) = total_size {
-        eprintln!("  Size: {:.1} MB", size as f64 / 1_048_576.0);
+        eprintln!("  [{}] Size: {:.1} MB", filename, size as f64 / 1_048_576.0);
     }
 
-    // --- Stream the body to a file ---
-    // `into_body()` consumes the response and gives us the Body.
-    // `.with_config().limit(u64::MAX)` removes the default 10 MB read limit
-    // (ureq v3 enforces this by default for safety).
-    // `.reader()` gives us a type that implements `std::io::Read`.
-    //
-    // We split the method chain into separate bindings because `.reader()`
-    // borrows from the Body — if Body were a temporary, the borrow would
-    // dangle. This is Rust's borrow checker keeping us safe: each intermediate
-    // value must live long enough for the next step to borrow from it.
-    let mut body = response.into_body();
-    let configured = body.with_config().limit(u64::MAX);
-    let body_reader = configured.reader();
-
-    // `File::create` opens a file for writing, creating it if it doesn't
-    // exist or truncating it if it does. Contrast with `File::open` which
-    // opens for reading only.
-    let writer = File::create(&local_path)?;
-
-    let bytes_written = download_with_progress(body_reader, writer, total_size)?;
-
-    eprintln!(
-        "  Done: {:.1} MB written to {}",
-        bytes_written as f64 / 1_048_576.0,
-        local_path.display()
-    );
-
-    Ok(true)
-}
-
-/// Stream bytes from `reader` to `writer` with periodic progress output.
-///
-/// ## `impl Read` / `impl Write` — trait bounds as parameters
-///
-/// Instead of accepting a concrete type like `File`, this function accepts
-/// *anything that implements `Read`* and *anything that implements `Write`*.
-/// This makes the function reusable (e.g., we could write to a Vec<u8> in
-/// tests) and is Rust's way of achieving polymorphism at compile time.
-///
-/// Returns the total number of bytes copied.
-fn download_with_progress(
-    mut reader: impl Read,
-    mut writer: impl Write,
-    total_size: Option<u64>,
-) -> Result<u64, io::Error> {
-    // Stack-allocated buffer — 64 KB is a good balance between syscall
-    // overhead and memory usage. This lives on the stack, not the heap,
-    // so there's no allocation cost.
-    let mut buf = [0u8; 65_536];
-
+    // Stream the response body to a file in 8 KB chunks.
+    // `into_body().into_reader()` gives us a `Read` implementor that
+    // pulls bytes from the HTTP response. We read in fixed-size chunks
+    // to keep memory usage constant.
+    let mut reader = response.into_body().into_reader();
+    let mut file = File::create(&local_path)?;
+    let mut buf = [0u8; 8192];
     let mut bytes_written: u64 = 0;
     let mut last_report: u64 = 0;
 
     loop {
-        // `.read()` fills the buffer with up to buf.len() bytes and
-        // returns how many were actually read. Returns 0 at EOF.
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
-
-        // `.write_all()` writes the entire slice, retrying as needed.
-        // Contrast with `.write()` which may write fewer bytes than requested.
-        writer.write_all(&buf[..n])?;
+        file.write_all(&buf[..n])?;
         bytes_written += n as u64;
 
-        // Print progress every ~10 MB to avoid flooding the terminal.
         if bytes_written - last_report >= 10 * 1_048_576 {
             last_report = bytes_written;
             match total_size {
                 Some(total) => {
                     let pct = (bytes_written as f64 / total as f64) * 100.0;
                     eprint!(
-                        "\r  Progress: {:.1} MB / {:.1} MB ({:.0}%)",
+                        "\r  [{}] Progress: {:.1} MB / {:.1} MB ({:.0}%)",
+                        filename,
                         bytes_written as f64 / 1_048_576.0,
                         total as f64 / 1_048_576.0,
                         pct,
@@ -236,7 +225,8 @@ fn download_with_progress(
                 }
                 None => {
                     eprint!(
-                        "\r  Progress: {:.1} MB",
+                        "\r  [{}] Progress: {:.1} MB",
+                        filename,
                         bytes_written as f64 / 1_048_576.0,
                     );
                 }
@@ -244,39 +234,90 @@ fn download_with_progress(
         }
     }
 
-    // Clear the progress line if we printed any progress
     if last_report > 0 {
         eprintln!();
     }
 
-    Ok(bytes_written)
+    eprintln!(
+        "  [{}] Done: {:.1} MB written",
+        filename,
+        bytes_written as f64 / 1_048_576.0,
+    );
+
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// WARC Parsing & .onion Extraction
+// ---------------------------------------------------------------------------
+
+/// Parse a WARC archive and extract unique .onion addresses.
+///
+/// Uses the `warc` crate for structured parsing: `WarcReader::from_path_gzip`
+/// handles gzip decompression internally and yields typed records. We filter
+/// to `RecordType::Response` (HTTP response bodies) where .onion links appear,
+/// skipping request records, metadata, and binary content.
+///
+/// The regex scans each response body for both v2 (16-char) and v3 (56-char)
+/// .onion addresses using base32 character classes.
+fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<dyn Error>> {
+    let reader = WarcReader::from_path_gzip(path)?;
+    let mut onions = HashSet::new();
+    let mut records_scanned: u64 = 0;
+    let filename = path.file_name().unwrap_or_default().to_string_lossy();
+
+    for result in reader.iter_records() {
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        if *record.warc_type() != RecordType::Response {
+            continue;
+        }
+
+        records_scanned += 1;
+
+        let body = String::from_utf8_lossy(record.body());
+        for m in onion_re.find_iter(&body) {
+            onions.insert(m.as_str().to_lowercase());
+        }
+
+        if records_scanned % 10_000 == 0 {
+            eprint!(
+                "\r  [{}] Scanning: {} records, {} onion(s)",
+                filename, records_scanned, onions.len()
+            );
+        }
+    }
+
+    if records_scanned >= 10_000 {
+        eprintln!();
+    }
+
+    Ok(onions)
+}
+
+// ---------------------------------------------------------------------------
+// Main — sequential processing loop
 // ---------------------------------------------------------------------------
 
 fn main() {
     // --- Parse CLI arguments ---
-    let (paths_file, limit) = parse_args();
+    let config = parse_args();
 
     eprintln!(
-        "Reading WARC paths from '{}' (limit: {})",
-        paths_file, limit
+        "Reading WARC paths from '{}' (limit: {}, delete after: {})",
+        config.paths_file, config.limit, config.delete
     );
 
-    // --- Open and read the paths file (Step 1 logic, refined) ---
-    let file = File::open(&paths_file).unwrap_or_else(|err| {
-        eprintln!("Error: cannot open '{}': {}", paths_file, err);
+    // --- Open and read the paths file ---
+    let file = File::open(&config.paths_file).unwrap_or_else(|err| {
+        eprintln!("Error: cannot open '{}': {}", config.paths_file, err);
         process::exit(1);
     });
     let reader = BufReader::new(file);
 
-    // --- Build the list of URIs ---
-    // `.lines()` yields Result<String> lazily.
-    // `.filter_map(Result::ok)` silently drops lines that fail to read.
-    // `.map(|l| ...)` trims whitespace from each line.
-    // `.filter(|l| ...)` drops empty lines.
     let uris: Vec<String> = reader
         .lines()
         .filter_map(Result::ok)
@@ -285,52 +326,139 @@ fn main() {
         .collect();
 
     if uris.is_empty() {
-        eprintln!("No paths found in '{}'", paths_file);
+        eprintln!("No paths found in '{}'", config.paths_file);
         process::exit(1);
     }
 
-    eprintln!("Found {} path(s) in file\n", uris.len());
+    eprintln!("Found {} path(s) in file", uris.len());
 
-    // --- Download loop ---
-    // We iterate through *all* URIs but only count actual downloads
-    // towards the limit. Already-downloaded files are skipped for free,
-    // so the program resumes where it left off on re-runs.
-    let mut download_count = 0;
-    let mut skip_count = 0;
-    let mut fail_count = 0;
+    // --- Load persistent state ---
+    let processed = load_processed();
+    let mut results = load_results();
+
+    eprintln!(
+        "State: {} already processed, {} onion(s) in results\n",
+        processed.len(),
+        results.len()
+    );
+
+    // --- Compile the .onion regex once ---
+    //
+    // `Regex::new()` compiles the pattern string into an efficient automaton.
+    // This compilation is expensive, so we do it once outside the loop.
+    // The `(?i)` flag makes the match case-insensitive (onion addresses are
+    // base32 and may appear in mixed case).
+    let onion_re =
+        Regex::new(r"(?i)\b[a-z2-7]{16}\.onion\b|\b[a-z2-7]{56}\.onion\b")
+            .expect("Invalid regex");
+
+    // --- Sequential processing loop ---
+    let mut process_count: usize = 0;
+    let mut skip_count: usize = 0;
+    let mut fail_count: usize = 0;
+    let mut new_onions: usize = 0;
 
     for (i, uri) in uris.iter().enumerate() {
-        // Stop once we've downloaded enough *new* files.
-        if download_count >= limit {
+        let filename = match filename_from_uri(uri) {
+            Ok(f) => f,
+            Err(err) => {
+                eprintln!("[{}] {}: {}", i + 1, uri, err);
+                continue;
+            }
+        };
+
+        // --- Check if already processed ---
+        if processed.contains(filename) {
+            eprintln!("[{}] {} — already processed, skipping", i + 1, filename);
+            skip_count += 1;
+            continue;
+        }
+
+        // --- Enforce processing limit ---
+        if process_count >= config.limit {
             eprintln!(
-                "Reached download limit of {}. Stopping.",
-                limit
+                "Reached processing limit of {}. Stopping.",
+                config.limit
             );
             break;
         }
 
-        eprintln!("[{}] {}", i + 1, uri);
+        eprintln!("[{}] {}", i + 1, filename);
 
-        match download_warc(uri) {
-            Ok(true) => {
-                // Actually downloaded a new file — counts towards limit.
-                download_count += 1;
+        // --- Download if not already on disk ---
+        let local_path: PathBuf = Path::new("download").join(filename);
+        if !local_path.exists() {
+            match download_warc(uri) {
+                Ok(_) => {}
+                Err(err) => {
+                    eprintln!("  [{}] Download error: {}", filename, err);
+                    fail_count += 1;
+                    eprintln!();
+                    continue;
+                }
             }
-            Ok(false) => {
-                // File already existed — skip doesn't count towards limit.
-                skip_count += 1;
+        } else {
+            eprintln!("  [{}] Already downloaded", filename);
+        }
+
+        // --- Parse the WARC archive ---
+        eprintln!("  [{}] Parsing...", filename);
+        match parse_warc(&local_path, &onion_re) {
+            Ok(onions) => {
+                eprintln!("  [{}] Found {} unique .onion address(es)", filename, onions.len());
+
+                let count_before = results.len();
+                for onion in onions {
+                    let archives = results.entry(onion).or_default();
+                    if !archives.contains(&filename.to_string()) {
+                        archives.push(filename.to_string());
+                    }
+                }
+                let added = results.len() - count_before;
+                new_onions += added;
+
+                // Mark as processed and save results after each archive.
+                // If either fails, the next run reprocesses this archive
+                // (safe, just redundant).
+                if let Err(err) = mark_processed(filename) {
+                    eprintln!("  Warning: couldn't mark as processed: {}", err);
+                }
+                if let Err(err) = save_results(&results) {
+                    eprintln!("  Warning: couldn't save results: {}", err);
+                }
+
+                process_count += 1;
+
+                // --- Optionally delete the archive ---
+                if config.delete {
+                    match fs::remove_file(&local_path) {
+                        Ok(()) => eprintln!("  [{}] Deleted {}", filename, local_path.display()),
+                        Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", filename, err),
+                    }
+                }
             }
             Err(err) => {
-                eprintln!("  Error: {}", err);
+                eprintln!("  [{}] Parse error: {}", filename, err);
                 fail_count += 1;
             }
         }
+
         eprintln!();
+    }
+
+    // --- Final save (safety net) ---
+    match save_results(&results) {
+        Ok(()) => eprintln!("Results saved to {}", RESULTS_FILE),
+        Err(err) => eprintln!("Error saving results: {}", err),
     }
 
     // --- Summary ---
     eprintln!(
-        "Summary: {} downloaded, {} skipped, {} failed",
-        download_count, skip_count, fail_count
+        "\nSummary: {} processed, {} skipped, {} failed, {} new onion(s)",
+        process_count, skip_count, fail_count, new_onions
+    );
+    eprintln!(
+        "Total: {} unique .onion address(es) in results",
+        results.len()
     );
 }
