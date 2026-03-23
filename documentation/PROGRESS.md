@@ -292,7 +292,7 @@ A concurrent processing pipeline that downloads and parses multiple WARC archive
 parallel. The sequential bottleneck (download 1 → parse 1 → download 2 → parse 2) is
 replaced with a pipeline where up to N archives download simultaneously, and parsing
 starts immediately when each download completes. A `--jobs N` flag controls the
-concurrency level (default 4).
+concurrency level and `--limit N` caps the number of archives to process.
 
 Key architectural changes:
 - Replaced `ureq` (blocking HTTP) with `reqwest` (async HTTP with Tokio)
@@ -373,3 +373,28 @@ fan out for independent work, fan in for shared state updates.
   blocking thread pool). Features: `rt-multi-thread`, `macros`, `fs`, `sync`
 - **Added `futures`**: stream utilities (`StreamExt`, `pin_mut!`, `buffer_unordered`)
   that complement Tokio's core functionality
+
+---
+
+## Additional Improvements
+
+### Smarter defaults for `--jobs` and `--limit`
+
+**Auto-detect CPU cores for `--jobs`** — The initial default of 4 concurrent jobs was
+an arbitrary constant. Replaced with `std::thread::available_parallelism()`, which
+queries the OS for the number of logical CPUs (hardware threads). The program now
+scales to the machine it runs on: a 16-core server uses 16 jobs, a 4-core laptop
+uses 4. Falls back to 1 if detection fails (e.g. constrained containers).
+
+**`std::thread::available_parallelism()` — runtime hardware detection**
+Returns `Result<NonZeroUsize>` — a safe, non-panicking query with no side effects.
+It's the standard library's replacement for the `num_cpus` crate (stable since Rust
+1.59). `NonZeroUsize` guarantees the value is at least 1, and `.get()` converts it
+to a plain `usize`.
+
+**Remove processing limit** — The initial default of `--limit 1` meant the program
+only processed one archive per run unless explicitly overridden. Changed to unlimited
+by default (internally `limit = 0`, with the limit check guarded by `limit > 0`).
+The program now processes all unprocessed URIs in the paths file, which is the
+expected behavior for a batch processing tool. `--limit N` remains available for
+testing or resource-constrained runs.

@@ -40,9 +40,9 @@ Requires Rust 1.91+ (edition 2024).
 ```sh
 cargo build              # compile (debug)
 cargo build --release    # compile (optimized — ~16s per 1GB archive)
-cargo run                # download & parse 1 archive (default)
+cargo run                # download & parse all archives
 cargo run -- --limit 3   # process up to 3 archives
-cargo run -- --jobs 2    # 2 concurrent downloads (default 4)
+cargo run -- --jobs 2    # 2 concurrent downloads (default: CPU cores)
 cargo run -- --delete    # delete archive after parsing
 cargo run -- --limit 3 --jobs 2 --delete custom.paths  # combined
 ```

@@ -6,9 +6,9 @@ Rust learning project that extracts `.onion` addresses from Common Crawl WARC ar
 
 ```sh
 cargo build              # compile
-cargo run                # download & parse 1 archive (default)
+cargo run                # download & parse all archives
 cargo run -- --limit 3   # process up to 3 archives
-cargo run -- --jobs 2    # 2 concurrent downloads (default 4)
+cargo run -- --jobs 2    # 2 concurrent downloads (default: CPU cores)
 cargo run -- --delete    # delete archive after parsing
 cargo run -- --limit 3 --jobs 2 --delete custom.paths  # combined
 ```
@@ -25,7 +25,7 @@ Steps 1–6 complete: full async pipeline from reading WARC paths → concurrent
 downloads → pipelined WARC parsing → `.onion` regex extraction → deduplication → JSON
 output. Three-state processing model (processed → skip, downloaded → parse, missing →
 download + parse). Multiple archives download in parallel (configurable `--jobs N`,
-default 4), and parsing starts immediately when each download completes via
+default: CPU core count), and parsing starts immediately when each download completes via
 `spawn_blocking`. Results stored in `output/onions.json`, processing state tracked in
 `output/processed.log`. Uses `reqwest` (async HTTP), `tokio` (async runtime), `futures`
 (stream utilities), `warc` (structured WARC parsing), `regex`, `serde_json`.
