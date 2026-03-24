@@ -356,11 +356,26 @@ async fn main() {
     );
 
     // --- Open and read the paths file ---
+    // Supports both plain text and gzip-compressed (.gz) paths files.
+    // Common Crawl distributes warc.paths.gz — we decompress transparently
+    // using `libflate`, which is already in the dependency tree via the `warc` crate.
     let file = File::open(&config.input).unwrap_or_else(|err| {
         eprintln!("Error: cannot open '{}': {}", config.input, err);
         process::exit(1);
     });
-    let reader = BufReader::new(file);
+
+    let reader: Box<dyn BufRead> = if config.input.ends_with(".gz") {
+        let decoder = libflate::gzip::Decoder::new(file).unwrap_or_else(|err| {
+            eprintln!(
+                "Error: failed to decompress '{}': {}",
+                config.input, err
+            );
+            process::exit(1);
+        });
+        Box::new(BufReader::new(decoder))
+    } else {
+        Box::new(BufReader::new(file))
+    };
 
     let uris: Vec<String> = reader
         .lines()
