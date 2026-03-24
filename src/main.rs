@@ -20,6 +20,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::stream::{self, StreamExt};
 use regex::Regex;
@@ -371,6 +372,8 @@ fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashSet<String>, Box<dyn 
 /// main task merges them sequentially — no locks needed.
 struct ArchiveResult {
     onions: HashSet<String>,
+    download_time: Duration,
+    parse_time: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +561,7 @@ async fn main() {
 
                 // --- Download if not already on disk ---
                 let local_path: PathBuf = Path::new("download").join(&filename);
+                let download_start = Instant::now();
                 if !local_path.exists() {
                     match download_warc_async(&client, &uri).await {
                         Ok(_) => {}
@@ -569,6 +573,8 @@ async fn main() {
                 } else {
                     eprintln!("  [{}] Already downloaded", filename);
                 }
+                let download_time = download_start.elapsed();
+                eprintln!("  [{}] Download time: {:.1}s", filename, download_time.as_secs_f64());
 
                 // --- Parse on the blocking thread pool ---
                 //
@@ -591,10 +597,12 @@ async fn main() {
                 let parse_path = local_path.clone();
                 let parse_re = Arc::clone(&onion_re);
 
+                let parse_start = Instant::now();
                 let parse_result = tokio::task::spawn_blocking(move || {
                     parse_warc(&parse_path, &parse_re)
                 })
                 .await;
+                let parse_time = parse_start.elapsed();
 
                 // `spawn_blocking` returns a `JoinHandle` — unwrap the
                 // outer Result (task panic) then the inner Result (parse error).
@@ -610,9 +618,10 @@ async fn main() {
                     }
                 };
 
+                eprintln!("  [{}] Parsing time: {:.1}s", filename, parse_time.as_secs_f64());
                 eprintln!("  [{}] Found {} unique .onion address(es)", filename, onions.len());
 
-                Ok((idx, filename, local_path, ArchiveResult { onions }))
+                Ok((idx, filename, local_path, ArchiveResult { onions, download_time, parse_time }))
             }
         })
         .buffer_unordered(config.jobs);
@@ -628,6 +637,8 @@ async fn main() {
     let mut process_count: usize = 0;
     let mut fail_count: usize = 0;
     let mut new_onions: usize = 0;
+    let mut total_download = Duration::ZERO;
+    let mut total_parse = Duration::ZERO;
 
     // `pin_mut!` pins the stream to the stack so we can poll it.
     // This is needed because `buffer_unordered` returns a stream that
@@ -637,6 +648,8 @@ async fn main() {
     while let Some(task_result) = archive_stream.next().await {
         match task_result {
             Ok((_idx, filename, local_path, archive)) => {
+                total_download += archive.download_time;
+                total_parse += archive.parse_time;
                 let count_before = results.len();
                 for onion in archive.onions {
                     let archives = results.entry(onion).or_default();
@@ -688,4 +701,12 @@ async fn main() {
         "Total: {} unique .onion address(es) in results",
         results.len()
     );
+    if process_count > 0 {
+        let avg_dl = total_download.as_secs_f64() / process_count as f64;
+        let avg_parse = total_parse.as_secs_f64() / process_count as f64;
+        eprintln!(
+            "Avg per archive: {:.1}s download, {:.1}s parsing",
+            avg_dl, avg_parse
+        );
+    }
 }
