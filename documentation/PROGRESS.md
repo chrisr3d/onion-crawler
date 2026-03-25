@@ -765,5 +765,78 @@ would add complexity for negligible benefit.
 
 ### What's next
 
+In-memory streaming mode to eliminate disk I/O from the pipeline.
+
+---
+
+## Step 9: In-Memory Streaming Mode (`--stream`)
+
+### What we built
+
+A `--stream` / `-m` CLI flag that downloads archives into memory instead of to disk,
+then parses directly from the in-memory buffer. The entire download/parse pipeline
+runs without touching the filesystem — no `download/` directory needed.
+
+The pipeline changes from:
+```
+HTTP chunks → write to disk → read from disk → decompress → parse
+```
+to:
+```
+HTTP chunks → collect in Vec<u8> → decompress from memory → parse
+```
+
+Three new functions in `lib.rs`:
+- `download_warc_to_memory` — streams HTTP chunks into a `Vec<u8>` instead of a file
+- `parse_warc_bytes_from_memory` — `Cursor<Vec<u8>>` → `MultiGzDecoder` → `WarcRecordIter` → regex search
+- `parse_warc_memchr_from_memory` — same pipeline with `memmem::Finder` search
+
+Compatible with `bytes` and `memchr` strategies only. Incompatible strategies
+(`baseline` — warc crate needs a file path; `mmap` — memory mapping needs a file
+descriptor) print a warning and fall back to disk mode automatically.
+
+### Rust concepts introduced
+
+**`std::io::Cursor<T>` — the adapter pattern**
+`Cursor` wraps any `AsRef<[u8]>` type (like `Vec<u8>`) and implements `Read` + `Seek`,
+making it interchangeable with a `File`. This is trait-based polymorphism in action:
+`MultiGzDecoder<R: Read>` doesn't care whether `R` is a `File` or a `Cursor<Vec<u8>>`
+— it just calls `.read()`. The same interface, different backing store. This is why
+`WarcRecordIter<R: BufRead>` works seamlessly with both — the generic constraint was
+already in place from Step 7, so adding in-memory support required zero changes to the
+parser.
+
+**Ownership transfer with `move` into `spawn_blocking`**
+When we call `spawn_blocking(move || parse_warc_memchr_from_memory(data, &filename))`,
+the `data: Vec<u8>` (potentially 800 MB) is *moved* from the async task to the blocking
+thread. This is a zero-cost operation — Rust moves the pointer, length, and capacity
+(3 machine words), not the 800 MB of data. After the move, the async task no longer
+owns the buffer, and the compiler rejects any attempt to use it. This is a concrete
+example of why Rust's ownership model exists: the compiler prevents use-after-move at
+compile time, which would be a dangling-pointer bug in C/C++.
+
+**`Vec::with_capacity` — pre-allocation**
+When `Content-Length` is available from the HTTP response, we pre-allocate the buffer
+to the exact size: `Vec::with_capacity(total_size as usize)`. Without this, `Vec`
+uses geometric growth — it doubles capacity each time it runs out of space. For an
+800 MB download, that means approximately 30 reallocations, each copying all existing
+data to a new, larger allocation. Pre-allocating does it in one shot. This is a general
+Rust pattern: when you know the approximate size upfront, always use `with_capacity`.
+
+**Graceful degradation — warning + fallback**
+When `--stream` is used with an incompatible strategy, we don't error out. Instead,
+we print a warning to stderr and fall back to disk mode. This is a good CLI UX pattern:
+the user's intent (parse this archive) is still achievable, just via a different path.
+The strategy incompatibility is a limitation, not a user error.
+
+**`Option<Vec<u8>>` for conditional data flow**
+The pipeline uses `Option<Vec<u8>>` to represent the in-memory buffer: `Some(buffer)`
+in stream mode, `None` in disk mode. The `spawn_blocking` closure then matches on
+`(strategy, memory_buffer)` — a tuple pattern match that dispatches to the right parse
+function based on both the strategy choice and whether we have in-memory data. This
+is idiomatic Rust: using the type system to make invalid states unrepresentable.
+
+### What's next
+
 Analysis and visualization of the extracted metadata — correlating clearnet URLs
 with onion addresses across crawl dates.

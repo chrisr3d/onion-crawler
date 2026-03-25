@@ -15,7 +15,10 @@ cargo run -- warc.paths -s memchr              # select parsing strategy (defaul
 cargo run -- warc.paths -s baseline            # original warc crate + regex
 cargo run -- warc.paths -s bytes               # custom parser + regex::bytes
 cargo run -- warc.paths -s mmap                # mmap + memchr (needs disk space)
+cargo run -- warc.paths -m                     # parse from memory (no disk I/O)
+cargo run -- warc.paths -s bytes --stream      # stream mode with bytes strategy
 cargo run -- warc.paths.gz -l 3 -j 2 -d       # combined (short flags)
+cargo run -- warc.paths.gz -l 3 -j 2 -m -s memchr  # combined with stream mode
 cargo run -- warc.paths --limit 3 --jobs 2 --delete --strategy memchr  # combined (long flags)
 cargo run -- --help                            # show usage and all options
 ```
@@ -28,7 +31,7 @@ cargo run -- --help                            # show usage and all options
 
 ## Current State
 
-Steps 1–8 complete: full async pipeline from reading WARC paths → concurrent HTTP
+Steps 1–9 complete: full async pipeline from reading WARC paths → concurrent HTTP
 downloads → pipelined WARC parsing → `.onion` extraction → deduplication → JSON
 output. Three-state processing model (processed → skip, downloaded → parse, missing →
 download + parse). Multiple archives download in parallel (configurable `-j N`,
@@ -38,11 +41,11 @@ metadata (URL, date, archive), processing state tracked in `output/processed.log
 
 Code is split into four files:
 - `src/main.rs` — CLI parsing + pipeline orchestration + strategy dispatch
-- `src/lib.rs` — download, parse functions (4 strategies), and state management
+- `src/lib.rs` — download, parse functions (4 strategies + 2 in-memory variants), and state management
 - `src/warc_parser.rs` — custom byte-level WARC parser (streaming + mmap slice)
 - `src/onion_search.rs` — onion extraction strategies (regex-bytes, memchr)
 
-CLI uses `clap` derive for argument parsing with short flags (`-l`, `-j`, `-d`, `-s`)
+CLI uses `clap` derive for argument parsing with short flags (`-l`, `-j`, `-d`, `-s`, `-m`)
 and auto-generated `--help`. Input paths file is a required positional argument and
 supports gzip-compressed `.gz` files (decompressed transparently via `libflate`).
 Per-archive timing reports download and parse durations, with averages in the final summary.
@@ -80,6 +83,21 @@ from the `warc` crate's parsed headers. `OnionSource` derives `Serialize`/`Deser
 via `serde` for JSON persistence. `load_results()` gracefully falls back to an empty
 map if the file contains the old format.
 
+### In-Memory Streaming Mode (Step 9)
+
+The `--stream` / `-m` flag downloads archives into a `Vec<u8>` in memory instead of
+writing to disk, then parses directly from that buffer using `std::io::Cursor`. This
+eliminates all disk I/O in the download/parse pipeline.
+
+Compatible with `bytes` and `memchr` strategies (which use the generic
+`WarcRecordIter<R: BufRead>` parser). Incompatible strategies (`baseline`, `mmap`)
+print a warning and fall back to disk mode. Memory cost: ~800 MB per archive ×
+concurrent jobs.
+
+Key concepts: `Cursor<Vec<u8>>` as a `Read` adapter (same interface as `File`),
+`Vec::with_capacity` pre-allocation from `Content-Length`, zero-cost ownership
+transfer of the buffer via `move` into `spawn_blocking`.
+
 Dependencies: `clap` (CLI parsing), `reqwest` (async HTTP), `tokio` (async runtime),
 `futures` (stream utilities), `warc` (baseline WARC parsing), `regex`, `serde`,
 `serde_json`, `libflate` (gzip for paths file), `flate2` with `zlib-ng` (gzip for
@@ -100,3 +118,4 @@ With `memchr` strategy + `zlib-ng`, release build parses an 864MB archive in ~5.
 6. ~~Concurrent downloads with async/tokio~~ (done)
 7. ~~Ripgrep-style parsing strategies~~ (done)
 8. ~~WARC metadata extraction~~ (done)
+9. ~~In-memory streaming mode~~ (done)

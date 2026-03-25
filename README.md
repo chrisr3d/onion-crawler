@@ -20,10 +20,11 @@ The project was built incrementally and now features the following:
 6. **Concurrent processing** — Download and parse multiple archives in parallel with async/tokio
 7. **Ripgrep-style parsing strategies** — Four optimization layers selectable at runtime (`-s`)
 8. **WARC metadata extraction** — Track source URL, crawl date, and archive for each `.onion` found
+9. **In-memory streaming** — Parse from memory with `--stream` / `-m` to skip disk I/O entirely
 
 Additional features:
 
-8. **CLI with `clap`** — Short flags (`-l`, `-j`, `-d`, `-s`), auto `--help`, required input file
+10. **CLI with `clap`** — Short flags (`-l`, `-j`, `-d`, `-s`, `-m`), auto `--help`, required input file
 9. **Timing** — Per-archive download/parse duration and averages in summary
 
 ## Rust Concepts Covered
@@ -38,6 +39,7 @@ Each step introduces new Rust fundamentals:
 - Regex and string processing
 - Concurrency patterns
 - Serialization with `serde` derive macros
+- In-memory I/O with `std::io::Cursor`
 - SIMD-accelerated byte searching (`memchr`)
 - Memory-mapped I/O (`mmap`)
 - `unsafe` blocks and when they're justified
@@ -61,7 +63,10 @@ cargo run -- warc.paths -s memchr              # select parsing strategy (defaul
 cargo run -- warc.paths -s baseline            # original warc crate + regex
 cargo run -- warc.paths -s bytes               # custom parser + regex::bytes
 cargo run -- warc.paths -s mmap                # mmap + memchr (needs disk space)
+cargo run -- warc.paths -m                     # parse from memory (no disk I/O)
+cargo run -- warc.paths -s bytes --stream      # stream mode with bytes strategy
 cargo run -- warc.paths.gz -l 3 -j 2 -d       # combined (short flags)
+cargo run -- warc.paths.gz -l 3 -j 2 -m -s memchr  # combined with stream mode
 cargo run -- warc.paths --limit 3 --jobs 2 --delete --strategy memchr  # combined (long flags)
 cargo run -- --help                            # show usage and all options
 ```
@@ -79,6 +84,11 @@ Four ripgrep-inspired optimization layers, selectable at runtime via `-s` / `--s
 
 Key optimizations: custom WARC parser skips non-response bodies (~60% of data), SIMD
 literal search replaces the regex engine, `zlib-ng` backend for faster gzip decompression.
+
+The `bytes` and `memchr` strategies also support `--stream` / `-m` mode, which downloads
+archives into memory and parses from a `Cursor<Vec<u8>>` instead of a file — eliminating
+all disk I/O. Incompatible strategies (`baseline`, `mmap`) fall back to disk mode with a
+warning. Memory cost: ~800 MB per archive × concurrent jobs.
 
 ## Output Format
 
