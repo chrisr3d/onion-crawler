@@ -28,13 +28,13 @@ cargo run -- --help                            # show usage and all options
 
 ## Current State
 
-Steps 1–7 complete: full async pipeline from reading WARC paths → concurrent HTTP
+Steps 1–8 complete: full async pipeline from reading WARC paths → concurrent HTTP
 downloads → pipelined WARC parsing → `.onion` extraction → deduplication → JSON
 output. Three-state processing model (processed → skip, downloaded → parse, missing →
 download + parse). Multiple archives download in parallel (configurable `-j N`,
 default: CPU core count), and parsing starts immediately when each download completes via
-`spawn_blocking`. Results stored in `output/onions.json`, processing state tracked in
-`output/processed.log`.
+`spawn_blocking`. Results stored in `output/onions.json` as nested JSON with source
+metadata (URL, date, archive), processing state tracked in `output/processed.log`.
 
 Code is split into four files:
 - `src/main.rs` — CLI parsing + pipeline orchestration + strategy dispatch
@@ -67,6 +67,19 @@ Key optimizations over the baseline:
   body slices (trades disk space for speed)
 - **`flate2` with `zlib-ng`** backend for SIMD-optimized gzip decompression
 
+### WARC Metadata Extraction (Step 8)
+
+Each `.onion` address is stored with its source context as an `OnionSource` struct:
+`url` (WARC-Target-URI — the crawled page), `date` (WARC-Date — crawl timestamp),
+and `archive` (the WARC filename). Output is nested JSON: each onion maps to a list
+of `OnionSource` objects, deduplicated on `(url, archive)` pairs.
+
+The custom WARC parser (`warc_parser.rs`) extracts `WARC-Target-URI` and `WARC-Date`
+headers alongside `WARC-Type` and `Content-Length`. The baseline strategy reads them
+from the `warc` crate's parsed headers. `OnionSource` derives `Serialize`/`Deserialize`
+via `serde` for JSON persistence. `load_results()` gracefully falls back to an empty
+map if the file contains the old format.
+
 Dependencies: `clap` (CLI parsing), `reqwest` (async HTTP), `tokio` (async runtime),
 `futures` (stream utilities), `warc` (baseline WARC parsing), `regex`, `serde`,
 `serde_json`, `libflate` (gzip for paths file), `flate2` with `zlib-ng` (gzip for
@@ -86,3 +99,4 @@ With `memchr` strategy + `zlib-ng`, release build parses an 864MB archive in ~5.
 5. ~~Deduplication and output formatting~~ (done)
 6. ~~Concurrent downloads with async/tokio~~ (done)
 7. ~~Ripgrep-style parsing strategies~~ (done)
+8. ~~WARC metadata extraction~~ (done)

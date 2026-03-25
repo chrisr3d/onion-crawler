@@ -19,6 +19,7 @@ The project was built incrementally and now features the following:
 5. **Deduplication & output** — Deduplicate results and produce structured JSON output
 6. **Concurrent processing** — Download and parse multiple archives in parallel with async/tokio
 7. **Ripgrep-style parsing strategies** — Four optimization layers selectable at runtime (`-s`)
+8. **WARC metadata extraction** — Track source URL, crawl date, and archive for each `.onion` found
 
 Additional features:
 
@@ -36,6 +37,7 @@ Each step introduces new Rust fundamentals:
 - Async programming with `tokio`
 - Regex and string processing
 - Concurrency patterns
+- Serialization with `serde` derive macros
 - SIMD-accelerated byte searching (`memchr`)
 - Memory-mapped I/O (`mmap`)
 - `unsafe` blocks and when they're justified
@@ -77,3 +79,23 @@ Four ripgrep-inspired optimization layers, selectable at runtime via `-s` / `--s
 
 Key optimizations: custom WARC parser skips non-response bodies (~60% of data), SIMD
 literal search replaces the regex engine, `zlib-ng` backend for faster gzip decompression.
+
+## Output Format
+
+Results are stored in `output/onions.json` as nested JSON. Each `.onion` address maps to
+a list of sources with the clearnet URL where it was found, the crawl date, and the archive:
+
+```json
+{
+  "example1234567890.onion": [
+    {
+      "url": "https://example.com/page",
+      "date": "2024-09-15T12:34:56Z",
+      "archive": "CC-NEWS-20240915.warc.gz"
+    }
+  ]
+}
+```
+
+Source metadata is extracted from WARC headers (`WARC-Target-URI`, `WARC-Date`) during
+parsing. Results are deduplicated on `(url, archive)` pairs.

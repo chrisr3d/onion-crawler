@@ -687,3 +687,83 @@ negligible.
   access via `&[u8]` slices.
 - **`flate2`** (with `zlib-ng`): Gzip decompression wrapping the SIMD-optimized zlib-ng
   C library. Replaces `libflate` for the custom parser's decompression path.
+
+---
+
+## Step 8: WARC Metadata Extraction
+
+### What we built
+
+Rich source context for every `.onion` address found. Previously, each onion mapped to
+a list of archive filenames (just "which WARC file"). Now each onion maps to a list of
+`OnionSource` structs containing three fields:
+
+- **`url`** — the clearnet page URL where the onion address appeared (from `WARC-Target-URI`)
+- **`date`** — when Common Crawl fetched that page (from `WARC-Date`)
+- **`archive`** — which WARC archive file contained the record
+
+This answers not just "which archive" but "which specific page, and when was it crawled?"
+— much more useful for analysis. The output format changed from flat to nested JSON:
+
+```json
+{
+  "example1234567890.onion": [
+    {
+      "url": "https://example.com/links",
+      "date": "2024-09-15T12:34:56Z",
+      "archive": "CC-NEWS-20240915.warc.gz"
+    }
+  ]
+}
+```
+
+Results are deduplicated on `(url, archive)` pairs — the same onion found on the same
+page in the same archive is recorded only once.
+
+### Rust concepts introduced
+
+**`#[derive(Serialize, Deserialize)]` — serde derive macros**
+The `serde` crate provides Rust's standard serialization framework. Adding
+`#[derive(Serialize, Deserialize)]` to a struct auto-generates all the code needed to
+convert it to/from any supported format (JSON, TOML, YAML, etc.) at compile time. The
+struct field names become the JSON keys directly. This is zero-cost at runtime — the
+generated code is as efficient as hand-written serialization. We use `Serialize` in
+`save_results()` (struct → JSON) and `Deserialize` in `load_results()` (JSON → struct).
+
+**`serde` — serialize + deserialize framework**
+`serde` itself is format-agnostic — it defines the `Serialize` and `Deserialize` traits
+that describe how a type converts to/from an abstract data model. The actual format
+encoding comes from companion crates like `serde_json`. This separation means the same
+`#[derive(Serialize)]` works for JSON, TOML, MessagePack, etc. without changing the
+struct. Previously we didn't need derive macros because `HashMap<String, Vec<String>>`
+has blanket `Serialize` implementations — but custom structs like `OnionSource` need
+the derive.
+
+**Backwards-compatible deserialization with `unwrap_or_default`**
+When the output format changes (from `HashMap<String, Vec<String>>` to
+`HashMap<String, Vec<OnionSource>>`), old JSON files won't parse into the new type.
+Instead of crashing, `load_results()` uses `serde_json::from_str(&content).unwrap_or_default()`,
+which falls back to an empty `HashMap` if deserialization fails. This is a practical
+pattern for evolving data formats: the first run after the format change reprocesses
+archives (since their onions aren't in the new results), and old results are silently
+replaced rather than causing errors.
+
+**Extracting WARC headers from the custom parser**
+The custom `WarcRecordIter` (streaming) and `WarcSliceIter` (mmap) were extended to
+extract `WARC-Target-URI` and `WARC-Date` headers alongside the existing `WARC-Type`
+and `Content-Length`. The streaming parser stores them as owned `String` fields in
+`WarcRecord`; the slice parser stores them as borrowed `&[u8]` slices in `WarcSlice`
+(zero-copy from the mmap region). The baseline strategy reads the same headers from
+the `warc` crate via `record.header(warc::WarcHeader::TargetURI)`.
+
+**`Clone` derive for shared references in search functions**
+`OnionSource` derives `Clone` because the same source metadata may be referenced
+multiple times when a single WARC record body contains multiple distinct onion
+addresses. Each match gets its own copy of the source. For small structs (three
+`String` fields), cloning is cheap — the alternative (wrapping in `Rc` or `Arc`)
+would add complexity for negligible benefit.
+
+### What's next
+
+Analysis and visualization of the extracted metadata — correlating clearnet URLs
+with onion addresses across crawl dates.
