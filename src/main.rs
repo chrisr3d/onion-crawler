@@ -25,9 +25,10 @@ use futures::stream::{self, StreamExt};
 use regex::Regex;
 
 use onion_crawler::{
-    download_warc_async, filename_from_uri, load_processed, load_results,
-    mark_processed, parse_warc, parse_warc_bytes, parse_warc_memchr, parse_warc_mmap,
-    save_results, OnionSource, RESULTS_FILE,
+    download_warc_async, download_warc_to_memory, filename_from_uri,
+    load_processed, load_results, mark_processed, parse_warc, parse_warc_bytes,
+    parse_warc_bytes_from_memory, parse_warc_memchr, parse_warc_memchr_from_memory,
+    parse_warc_mmap, save_results, OnionSource, RESULTS_FILE
 };
 
 // ---------------------------------------------------------------------------
@@ -52,7 +53,7 @@ enum Strategy {
     /// Custom parser + SIMD memmem literal search (no regex engine)
     Memchr,
     /// Decompress → mmap → zero-copy memchr search
-    Mmap,
+    Mmap
 }
 
 // ---------------------------------------------------------------------------
@@ -102,6 +103,10 @@ struct Config {
     /// Parsing strategy: baseline, bytes, memchr, or mmap
     #[arg(short, long, value_enum, default_value_t = Strategy::Memchr)]
     strategy: Strategy,
+
+    /// Parse from memory instead of disk (skips file I/O, uses more RAM)
+    #[arg(short = 'm', long)]
+    stream: bool
 }
 
 // ---------------------------------------------------------------------------
@@ -149,17 +154,48 @@ async fn main() {
 
     let limit_display = match config.limit {
         Some(n) => format!("{}", n),
-        None => "all".to_string(),
+        None => "all".to_string()
     };
     let strategy_name = match config.strategy {
         Strategy::Baseline => "baseline (warc crate + regex)",
         Strategy::Bytes => "bytes (custom parser + regex::bytes)",
         Strategy::Memchr => "memchr (custom parser + SIMD memmem)",
-        Strategy::Mmap => "mmap (decompress + mmap + SIMD memmem)",
+        Strategy::Mmap => "mmap (decompress + mmap + SIMD memmem)"
     };
+
+    // --- Check stream mode compatibility ---
+    //
+    // ## Graceful degradation
+    //
+    // Not all strategies support in-memory parsing. Rather than erroring
+    // out, we warn the user and fall back to disk mode. This is a common
+    // CLI UX pattern: prefer doing the right thing with a warning over
+    // refusing to run.
+    let stream_enabled = if config.stream {
+        match config.strategy {
+            Strategy::Baseline => {
+                eprintln!(
+                    "Warning: --stream is not compatible with 'baseline' strategy \
+                     (warc crate requires a file path). Falling back to disk mode."
+                );
+                false
+            }
+            Strategy::Mmap => {
+                eprintln!(
+                    "Warning: --stream is not compatible with 'mmap' strategy \
+                     (memory mapping requires a file). Falling back to disk mode."
+                );
+                false
+            }
+            Strategy::Bytes | Strategy::Memchr => true,
+        }
+    } else {
+        false
+    };
+
     eprintln!(
-        "Reading WARC paths from '{}' (limit: {}, jobs: {}, delete after: {}, strategy: {})",
-        config.input, limit_display, config.jobs, config.delete, strategy_name
+        "Reading WARC paths from '{}' (limit: {}, jobs: {}, delete after: {}, strategy: {}, stream: {})",
+        config.input, limit_display, config.jobs, config.delete, strategy_name, stream_enabled
     );
 
     // --- Open and read the paths file ---
@@ -245,7 +281,7 @@ async fn main() {
         // Still save results (safety net) and print summary.
         match save_results(&results) {
             Ok(()) => eprintln!("Results saved to {}", RESULTS_FILE),
-            Err(err) => eprintln!("Error saving results: {}", err),
+            Err(err) => eprintln!("Error saving results: {}", err)
         }
         eprintln!(
             "\nSummary: 0 processed, {} skipped, 0 failed, 0 new onion(s)",
@@ -279,7 +315,7 @@ async fn main() {
     // We still compile it unconditionally to keep the code simple.
     let onion_re = Arc::new(
         Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")
-            .expect("Invalid regex"),
+            .expect("Invalid regex")
     );
 
     let strategy = config.strategy;
@@ -331,20 +367,40 @@ async fn main() {
 
                 eprintln!("[{}] {}", idx, filename);
 
-                // --- Download if not already on disk ---
+                // --- Download phase ---
+                //
+                // In stream mode, we download to memory (`Vec<u8>`) instead
+                // of disk. The compressed bytes stay in RAM and are passed
+                // directly to the parser. In disk mode, we write to
+                // `download/<filename>` as before.
                 let local_path: PathBuf = Path::new("download").join(&filename);
                 let download_start = Instant::now();
-                if !local_path.exists() {
-                    match download_warc_async(&client, &uri).await {
-                        Ok(_) => {}
+
+                // `Option<Vec<u8>>` holds the in-memory buffer in stream mode.
+                // In disk mode, this stays `None` and the parser reads from disk.
+                let memory_buffer: Option<Vec<u8>> = if stream_enabled {
+                    match download_warc_to_memory(&client, &uri).await {
+                        Ok(buf) => Some(buf),
                         Err(err) => {
                             eprintln!("  [{}] Download error: {}", filename, err);
                             return Err(format!("{}: download error: {}", filename, err));
                         }
                     }
                 } else {
-                    eprintln!("  [{}] Already downloaded", filename);
-                }
+                    if !local_path.exists() {
+                        match download_warc_async(&client, &uri).await {
+                            Ok(_) => {}
+                            Err(err) => {
+                                eprintln!("  [{}] Download error: {}", filename, err);
+                                return Err(format!("{}: download error: {}", filename, err));
+                            }
+                        }
+                    } else {
+                        eprintln!("  [{}] Already downloaded", filename);
+                    }
+                    None
+                };
+
                 let download_time = download_start.elapsed();
                 eprintln!("  [{}] Download time: {:.1}s", filename, download_time.as_secs_f64());
 
@@ -362,25 +418,36 @@ async fn main() {
                 // async task until the blocking work finishes, freeing the
                 // worker thread for other downloads.
                 //
-                // Rule of thumb: if a function does CPU work or calls
-                // blocking I/O for more than a few microseconds, use
-                // `spawn_blocking`.
-                eprintln!("  [{}] Parsing ({})...", filename, match strategy {
+                // In stream mode, the `Vec<u8>` buffer is *moved* into the
+                // blocking closure — this is a zero-cost ownership transfer
+                // (no data copying). After the move, the async task no longer
+                // owns the buffer, and the compiler prevents use-after-move.
+                let strategy_label = match strategy {
                     Strategy::Baseline => "baseline",
-                    Strategy::Bytes => "bytes",
-                    Strategy::Memchr => "memchr",
-                    Strategy::Mmap => "mmap",
-                });
+                    Strategy::Bytes => if stream_enabled { "bytes/stream" } else { "bytes" },
+                    Strategy::Memchr => if stream_enabled { "memchr/stream" } else { "memchr" },
+                    Strategy::Mmap => "mmap"
+                };
+                eprintln!("  [{}] Parsing ({})...", filename, strategy_label);
                 let parse_path = local_path.clone();
                 let parse_re = Arc::clone(&onion_re);
+                let parse_filename = filename.clone();
 
                 let parse_start = Instant::now();
                 let parse_result = tokio::task::spawn_blocking(move || {
-                    match strategy {
-                        Strategy::Baseline => parse_warc(&parse_path, &parse_re),
-                        Strategy::Bytes => parse_warc_bytes(&parse_path),
-                        Strategy::Memchr => parse_warc_memchr(&parse_path),
-                        Strategy::Mmap => parse_warc_mmap(&parse_path),
+                    match (strategy, memory_buffer) {
+                        // Stream mode: parse from in-memory buffer
+                        (Strategy::Bytes, Some(data)) => {
+                            parse_warc_bytes_from_memory(data, &parse_filename)
+                        }
+                        (Strategy::Memchr, Some(data)) => {
+                            parse_warc_memchr_from_memory(data, &parse_filename)
+                        }
+                        // Disk mode: parse from file (existing behavior)
+                        (Strategy::Baseline, _) => parse_warc(&parse_path, &parse_re),
+                        (Strategy::Bytes, None) => parse_warc_bytes(&parse_path),
+                        (Strategy::Memchr, None) => parse_warc_memchr(&parse_path),
+                        (Strategy::Mmap, _) => parse_warc_mmap(&parse_path)
                     }
                 })
                 .await;
@@ -453,10 +520,12 @@ async fn main() {
 
                 process_count += 1;
 
-                if delete {
+                // In stream mode there is no local file to delete — the
+                // data was parsed from memory and already dropped.
+                if delete && !stream_enabled {
                     match fs::remove_file(&local_path) {
                         Ok(()) => eprintln!("  [{}] Deleted {}", filename, local_path.display()),
-                        Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", filename, err),
+                        Err(err) => eprintln!("  [{}] Warning: couldn't delete: {}", filename, err)
                     }
                 }
 
@@ -473,7 +542,7 @@ async fn main() {
     // --- Final save (safety net) ---
     match save_results(&results) {
         Ok(()) => eprintln!("Results saved to {}", RESULTS_FILE),
-        Err(err) => eprintln!("Error saving results: {}", err),
+        Err(err) => eprintln!("Error saving results: {}", err)
     }
 
     // --- Summary ---

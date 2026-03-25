@@ -19,7 +19,7 @@ pub mod warc_parser;
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufReader, Write};
+use std::io::{self, BufReader, Cursor, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::read::MultiGzDecoder;
@@ -175,6 +175,94 @@ pub async fn download_warc_async(
     Ok(true)
 }
 
+/// Download a WARC archive into memory instead of to disk.
+///
+/// ## Why in-memory?
+///
+/// The disk-based pipeline writes every byte to disk during download, then
+/// reads it back for parsing — the data crosses the I/O boundary twice.
+/// By collecting chunks into a `Vec<u8>`, we skip disk I/O entirely and
+/// parse directly from memory.
+///
+/// ## `Vec::with_capacity` — pre-allocation
+///
+/// When `Content-Length` is available, we pre-allocate the buffer to the
+/// exact size. Without this, `Vec` grows geometrically (double on each
+/// reallocation), which means ~30 allocate-copy-free cycles for an 800 MB
+/// download. Pre-allocation does it in one shot.
+///
+/// ## Trade-off: memory vs disk
+///
+/// Each archive is ~800 MB compressed. With `-j 4`, that's ~3.2 GB of RAM.
+/// This is acceptable for modern machines and comparable to what the `mmap`
+/// strategy uses in virtual memory. The benefit is zero disk usage in the
+/// `download/` directory.
+pub async fn download_warc_to_memory(
+    client: &reqwest::Client,
+    uri: &str
+) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>> {
+    let url = format!("{}{}", COMMONCRAWL_BASE, uri);
+    let filename = filename_from_uri(uri).map_err(|e| -> Box<dyn Error + Send + Sync> {
+        e.into()
+    })?;
+
+    eprintln!("  [{}] Downloading to memory...", filename);
+    eprintln!("  [{}] URL: {}", filename, url);
+
+    let mut response = client.get(&url).send().await?.error_for_status()?;
+
+    let total_size = response.content_length();
+    if let Some(size) = total_size {
+        eprintln!("  [{}] Size: {:.1} MB", filename, size as f64 / 1_048_576.0);
+    }
+
+    // Pre-allocate the buffer when the size is known, avoiding repeated
+    // geometric-growth reallocations (each doubling copies all existing data).
+    let mut buffer: Vec<u8> = Vec::with_capacity(total_size.unwrap_or(0) as usize);
+    let mut bytes_read: u64 = 0;
+    let mut last_report: u64 = 0;
+
+    while let Some(chunk) = response.chunk().await? {
+        buffer.extend_from_slice(&chunk);
+        bytes_read += chunk.len() as u64;
+
+        if bytes_read - last_report >= 10 * 1_048_576 {
+            last_report = bytes_read;
+            match total_size {
+                Some(total) => {
+                    let pct = (bytes_read as f64 / total as f64) * 100.0;
+                    eprint!(
+                        "\r  [{}] Progress: {:.1} MB / {:.1} MB ({:.0}%)",
+                        filename,
+                        bytes_read as f64 / 1_048_576.0,
+                        total as f64 / 1_048_576.0,
+                        pct
+                    );
+                }
+                None => {
+                    eprint!(
+                        "\r  [{}] Progress: {:.1} MB",
+                        filename,
+                        bytes_read as f64 / 1_048_576.0
+                    );
+                }
+            }
+        }
+    }
+
+    if last_report > 0 {
+        eprintln!();
+    }
+
+    eprintln!(
+        "  [{}] Done: {:.1} MB in memory",
+        filename,
+        bytes_read as f64 / 1_048_576.0
+    );
+
+    Ok(buffer)
+}
+
 // ---------------------------------------------------------------------------
 // WARC Parsing & .onion Extraction
 // ---------------------------------------------------------------------------
@@ -203,7 +291,7 @@ pub fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashMap<String, Vec<O
     for result in reader.iter_records() {
         let record = match result {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => continue
         };
 
         if *record.warc_type() != RecordType::Response {
@@ -222,7 +310,7 @@ pub fn parse_warc(path: &Path, onion_re: &Regex) -> Result<HashMap<String, Vec<O
         let source = OnionSource {
             url: target_uri,
             date,
-            archive: archive.clone(),
+            archive: archive.clone()
         };
 
         let body = String::from_utf8_lossy(record.body());
@@ -279,7 +367,7 @@ pub fn parse_warc_bytes(path: &Path) -> Result<HashMap<String, Vec<OnionSource>>
         let source = OnionSource {
             url: record.target_uri,
             date: record.date,
-            archive: archive.clone(),
+            archive: archive.clone()
         };
         onion_search::search_regex_bytes(&record.body, &onion_re, &source, &mut onions);
 
@@ -330,7 +418,7 @@ pub fn parse_warc_memchr(path: &Path) -> Result<HashMap<String, Vec<OnionSource>
         let source = OnionSource {
             url: record.target_uri,
             date: record.date,
-            archive: archive.clone(),
+            archive: archive.clone()
         };
         onion_search::search_memchr(&record.body, &finder, &source, &mut onions);
 
@@ -338,6 +426,103 @@ pub fn parse_warc_memchr(path: &Path) -> Result<HashMap<String, Vec<OnionSource>
             eprint!(
                 "\r  [{}] Scanning (memchr): {} records, {} onion(s)",
                 filename, records_scanned, onions.len()
+            );
+        }
+    }
+
+    if records_scanned >= 10_000 {
+        eprintln!();
+    }
+
+    Ok(onions)
+}
+
+/// Parse a WARC archive from an in-memory buffer using `regex::bytes`.
+///
+/// ## `std::io::Cursor` — the adapter pattern
+///
+/// `Cursor<Vec<u8>>` wraps a byte vector and implements the `Read` trait,
+/// making it interchangeable with a `File`. This is Rust's adapter pattern:
+/// `MultiGzDecoder` doesn't care whether its inner `Read` is a file on disk
+/// or bytes in memory — it just calls `.read()`. Same interface, different
+/// backing store.
+///
+/// ## Ownership transfer
+///
+/// The `data: Vec<u8>` parameter takes ownership of the buffer. When this
+/// function is called from `spawn_blocking(move || ...)`, the ~800 MB
+/// buffer is *moved* (zero-copy) from the async task to the blocking thread.
+/// After the move, the async task no longer owns the buffer, and the compiler
+/// prevents use-after-move at compile time.
+pub fn parse_warc_bytes_from_memory(data: Vec<u8>, archive_name: &str) -> Result<HashMap<String, Vec<OnionSource>>, Box<dyn Error + Send + Sync>> {
+    // Cursor wraps Vec<u8> to implement Read — no disk I/O involved.
+    let cursor = Cursor::new(data);
+    let decoder = MultiGzDecoder::new(cursor);
+    let buf_reader = BufReader::new(decoder);
+    let iter = warc_parser::WarcRecordIter::new(buf_reader);
+
+    let onion_re = regex::bytes::Regex::new(r"\b([a-z2-7]{16}|[a-z2-7]{56})\.onion\b")?;
+    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
+    let mut records_scanned: u64 = 0;
+    let archive = archive_name.to_string();
+
+    for result in iter {
+        let record = result?;
+        records_scanned += 1;
+
+        let source = OnionSource {
+            url: record.target_uri,
+            date: record.date,
+            archive: archive.clone()
+        };
+        onion_search::search_regex_bytes(&record.body, &onion_re, &source, &mut onions);
+
+        if records_scanned % 10_000 == 0 {
+            eprint!(
+                "\r  [{}] Scanning (bytes/stream): {} records, {} onion(s)",
+                archive_name, records_scanned, onions.len()
+            );
+        }
+    }
+
+    if records_scanned >= 10_000 {
+        eprintln!();
+    }
+
+    Ok(onions)
+}
+
+/// Parse a WARC archive from an in-memory buffer using SIMD `memmem` search.
+///
+/// Same as `parse_warc_memchr` but reads from `Cursor<Vec<u8>>` instead of
+/// a file on disk. See `parse_warc_bytes_from_memory` for the `Cursor`
+/// explanation.
+pub fn parse_warc_memchr_from_memory(data: Vec<u8>, archive_name: &str) -> Result<HashMap<String, Vec<OnionSource>>, Box<dyn Error + Send + Sync>> {
+    let cursor = Cursor::new(data);
+    let decoder = MultiGzDecoder::new(cursor);
+    let buf_reader = BufReader::new(decoder);
+    let iter = warc_parser::WarcRecordIter::new(buf_reader);
+
+    let finder = memmem::Finder::new(b".onion");
+    let mut onions: HashMap<String, Vec<OnionSource>> = HashMap::new();
+    let mut records_scanned: u64 = 0;
+    let archive = archive_name.to_string();
+
+    for result in iter {
+        let record = result?;
+        records_scanned += 1;
+
+        let source = OnionSource {
+            url: record.target_uri,
+            date: record.date,
+            archive: archive.clone()
+        };
+        onion_search::search_memchr(&record.body, &finder, &source, &mut onions);
+
+        if records_scanned % 10_000 == 0 {
+            eprint!(
+                "\r  [{}] Scanning (memchr/stream): {} records, {} onion(s)",
+                archive_name, records_scanned, onions.len()
             );
         }
     }
@@ -413,7 +598,7 @@ pub fn parse_warc_mmap(path: &Path) -> Result<HashMap<String, Vec<OnionSource>>,
         let source = OnionSource {
             url: String::from_utf8_lossy(record.target_uri).to_string(),
             date: String::from_utf8_lossy(record.date).to_string(),
-            archive: archive.clone(),
+            archive: archive.clone()
         };
         onion_search::search_memchr(record.body, &finder, &source, &mut onions);
 
