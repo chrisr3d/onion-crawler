@@ -548,3 +548,142 @@ Functions and constants in `lib.rs` that `main.rs` needs must be marked `pub` (p
 By default, items in Rust are private to their module. `pub` makes them accessible from
 outside the crate. This is Rust's encapsulation: the library controls exactly what it
 exposes.
+
+---
+
+## Step 7: Ripgrep-Style Parsing Strategies
+
+### What we built
+
+Four progressively optimized parsing strategies inspired by how ripgrep achieves its
+speed, selectable at runtime via `-s` / `--strategy`. Each strategy produces identical
+results but uses different techniques, so they can be benchmarked against each other on
+the same archive. The default strategy (`memchr`) processes an 864MB archive in ~5.6s
+— down from ~16s with the baseline.
+
+| Strategy | Parser | Search | Performance |
+|----------|--------|--------|-------------|
+| `baseline` | `warc` crate | `regex::Regex` on UTF-8 `String` | ~16s/GB |
+| `bytes` | Custom streaming | `regex::bytes::Regex` on `&[u8]` | ~1.5-2x faster |
+| `memchr` | Custom streaming | SIMD `memmem` literal search | ~3-5x faster |
+| `mmap` | Custom slice (mmap) | SIMD `memmem` + zero-copy bodies | ~3-6x faster |
+
+Two new modules were added:
+- **`src/warc_parser.rs`** — Custom byte-level WARC parser (streaming + mmap slice)
+- **`src/onion_search.rs`** — Onion extraction strategies (regex-bytes, memchr)
+
+### Rust concepts introduced
+
+**`regex::bytes::Regex` — searching raw bytes without UTF-8 conversion**
+The `regex` crate has two modules most people don't know about: `regex::Regex` searches
+`&str` (requires valid UTF-8), while `regex::bytes::Regex` searches `&[u8]` (arbitrary
+bytes). ripgrep uses `regex::bytes` exclusively because real-world files contain invalid
+UTF-8. By searching `&[u8]` directly, the `bytes` strategy eliminates the
+`String::from_utf8_lossy()` allocation that the baseline makes for every record body —
+instead of converting hundreds of KB per record to a `String`, we search the raw bytes
+and only convert the 22-62 byte match.
+
+**`memchr::memmem::Finder` — SIMD-accelerated literal search**
+The core technique behind ripgrep's speed. `memmem::Finder::new(b".onion")` compiles a
+SIMD-accelerated searcher that scans bytes at 16-32 bytes per CPU cycle (SSE2/AVX2 on
+x86_64, NEON on ARM). Instead of running the regex NFA/DFA engine on every byte of every
+record body, we jump directly to `.onion` occurrences and validate the surrounding bytes
+with cheap comparisons. Since `.onion` is rare in typical web content (0-2 matches per
+50-500 KB body), the validator almost never runs.
+
+This is ripgrep's key insight applied: **extract literal substrings from the regex
+pattern, use SIMD to find candidates, then validate only those positions.** Our pattern
+`\b[a-z2-7]{16,56}\.onion\b` has the fixed literal `.onion`, making it a perfect
+candidate for this optimization.
+
+**`#[inline(always)]` — controlling function inlining**
+For tiny predicate functions like `is_onion_char(b: u8) -> bool` that are called in hot
+loops, `#[inline(always)]` tells the compiler to inline the function body at every call
+site. This eliminates function-call overhead (register push/pop, jump) and lets the
+compiler optimize the inlined code within the loop context — e.g., keeping the byte value
+in a register instead of passing it on the stack. Without the hint, the compiler might
+not inline across module boundaries.
+
+**Custom `BufRead`-based WARC parser — selective parsing**
+The `warc` crate (v0.4) parses ALL headers with `nom` and allocates a `HashMap` per
+record. Our custom `WarcRecordIter` reads headers line-by-line and only extracts
+`WARC-Type` and `Content-Length` — everything else is ignored with zero allocation. For
+non-response records (request, metadata, warcinfo — ~60% of all records), the body is
+skipped entirely by reading and discarding `content_length` bytes through a stack buffer.
+This means ~60% of the decompressed data is never read into heap memory.
+
+**`memmap2::Mmap` — memory-mapped file I/O**
+Memory mapping makes the OS map a file's contents directly into the process's virtual
+address space. Instead of explicit `read()` syscalls, data access happens through page
+faults handled by the kernel's virtual memory system. Benefits: zero-copy body slices
+(`&[u8]` into the mapped region, no `Vec<u8>` allocation), efficient page cache usage,
+and no read syscalls. The trade-off: gzip is a streaming format, so we must decompress
+the entire archive to a temporary file first, then mmap that. This costs disk space
+(~3-5x the compressed size) but enables the zero-copy parsing.
+
+**`unsafe` blocks — controlled unsafety for `mmap`**
+`memmap2::Mmap::map()` requires an `unsafe` block because the OS could theoretically
+modify the mapped file while we're reading it (another process could write to it),
+causing undefined behavior. We document why our usage is safe: we created the temp file
+and no other process modifies it. `unsafe` doesn't mean "dangerous" — it means "the
+programmer is responsible for upholding invariants the compiler can't verify." Keeping
+`unsafe` blocks small and well-documented is idiomatic Rust.
+
+**`WarcSliceIter` — zero-copy parsing on contiguous slices**
+When data is in a contiguous `&[u8]` (from mmap), we can use a different parser that
+returns `&[u8]` body slices instead of owned `Vec<u8>`. This is zero-copy: the body
+bytes stay in the OS page cache and are never copied to the heap. The slice parser also
+uses `memmem` to find `\r\n\r\n` header boundaries (faster than line-by-line reading on
+contiguous data). This is only possible when the entire decompressed content is available
+at once — the streaming parser can't do this because buffers get reused.
+
+**`flate2` with `zlib-ng` — SIMD-optimized decompression**
+The default `flate2` backend is `miniz_oxide` (pure Rust). Switching to `zlib-ng` — a
+heavily SIMD-optimized C library for inflate — gave a significant decompression speedup.
+Since gzip decompression is the bottleneck for all strategies (not the search), this
+benefits every strategy equally:
+
+```toml
+flate2 = { version = "1", features = ["zlib-ng"], default-features = false }
+```
+
+This links against zlib-ng built from source via `cmake`. It requires a C compiler and
+cmake on the build machine, which is a trade-off for portability. The `libflate` crate
+is kept for paths-file decompression (small files where performance doesn't matter).
+
+**`clap::ValueEnum` — type-safe enum CLI arguments**
+`#[derive(ValueEnum)]` on the `Strategy` enum lets `clap` parse strategy names directly
+from the CLI (`--strategy memchr`). The derive macro auto-generates the list of valid
+values for `--help` and provides compile-time exhaustive matching in the dispatch code.
+Doc comments on enum variants become the help text for each option.
+
+**Manual ASCII digit parsing — avoiding hidden costs**
+`Content-Length` values in WARC headers are always ASCII digits. `parse_ascii_usize()`
+converts them to `usize` with a direct arithmetic loop instead of `str::parse::<usize>()`.
+This avoids: (1) UTF-8 validation (we know it's ASCII), (2) error type construction
+(we return 0 for malformed input), (3) generic trait dispatch. For a hot path called
+hundreds of thousands of times per archive, these micro-optimizations compound.
+
+### Architecture: why four strategies, not just the fastest?
+
+This is a teaching project. Having all four strategies in the same binary lets you:
+1. **Benchmark each optimization in isolation** — run the same archive with `-s baseline`
+   then `-s memchr` and compare timing directly
+2. **Understand what each technique buys** — the speedup from `baseline` to `bytes` is
+   purely about avoiding UTF-8 conversion; from `bytes` to `memchr` is about replacing
+   regex with SIMD literals
+3. **See the trade-offs** — `mmap` is theoretically fastest but needs 3-5x disk space
+   for the temp file and requires `unsafe`; `memchr` is nearly as fast with no downsides
+
+Runtime selection via CLI flag (not cargo features) means you build once and benchmark
+all four strategies without recompiling. The binary size cost of including all four is
+negligible.
+
+### Dependencies added
+
+- **`memchr`**: SIMD-accelerated byte/substring search — the engine behind ripgrep's
+  literal optimization. Provides `memmem::Finder` for searching byte slices.
+- **`memmap2`**: Memory-mapped file I/O. Maps files into virtual memory for zero-copy
+  access via `&[u8]` slices.
+- **`flate2`** (with `zlib-ng`): Gzip decompression wrapping the SIMD-optimized zlib-ng
+  C library. Replaces `libflate` for the custom parser's decompression path.
