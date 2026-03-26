@@ -36,7 +36,8 @@ downloads → pipelined WARC parsing → `.onion` extraction → deduplication �
 output. Three-state processing model (processed → skip, downloaded → parse, missing →
 download + parse). Multiple archives download in parallel (configurable `-j N`,
 default: CPU core count), and parsing starts immediately when each download completes via
-`spawn_blocking`. Results stored in `output/onions.json` as nested JSON with source
+`spawn_blocking`. Layered resource guards cap concurrency at 2× CPU cores and available
+RAM (stream mode). Results stored in `output/onions.json` as nested JSON with source
 metadata (URL, date, archive), processing state tracked in `output/processed.log`.
 
 Code is split into four files:
@@ -97,6 +98,26 @@ concurrent jobs.
 Key concepts: `Cursor<Vec<u8>>` as a `Read` adapter (same interface as `File`),
 `Vec::with_capacity` pre-allocation from `Content-Length`, zero-cost ownership
 transfer of the buffer via `move` into `spawn_blocking`.
+
+### Resource Guards (Step 9b)
+
+Layered concurrency caps prevent oversubscription and OOM:
+
+1. **CPU cap**: `min(config.jobs, 2 × cpu_cores)` — beyond 2× cores, `spawn_blocking`
+   tasks queue up adding context switching overhead without throughput gain.
+2. **RAM cap** (stream mode only): `min(capped_jobs, available_ram / 1 GB)` — each
+   in-memory archive costs ~800 MB–1 GB; exceeding available RAM causes OOM.
+3. **`buffer_unordered(effective_jobs)`** — natural backpressure: finished jobs free
+   their buffers before new ones start.
+
+`effective_jobs = min(config.jobs, 2 × cores, available_ram / 1 GB)` — the most
+restrictive limit wins. In disk mode, the RAM cap is skipped.
+
+`get_available_memory()` uses `#[cfg(target_os)]` conditional compilation with three
+platform-specific implementations (all safe Rust, no `unsafe`):
+- **macOS**: `std::process::Command` running `sysctl -n` for page size + free/speculative/purgeable pages
+- **Linux**: parsing `MemAvailable` from `/proc/meminfo`
+- **Other**: returns `None` (skips RAM check, proceeds with CPU-capped jobs)
 
 Dependencies: `clap` (CLI parsing), `reqwest` (async HTTP), `tokio` (async runtime),
 `futures` (stream utilities), `warc` (baseline WARC parsing), `regex`, `serde`,

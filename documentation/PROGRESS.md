@@ -836,6 +836,49 @@ in stream mode, `None` in disk mode. The `spawn_blocking` closure then matches o
 function based on both the strategy choice and whether we have in-memory data. This
 is idiomatic Rust: using the type system to make invalid states unrepresentable.
 
+### Resource Guards (Step 9b)
+
+After adding stream mode, an edge case emerged: running many concurrent stream jobs
+could exhaust available RAM (each archive is ~800 MB–1 GB in memory). We added
+layered resource guards to cap concurrency safely.
+
+**`std::thread::available_parallelism()` — querying CPU cores**
+This returns the number of hardware threads (logical cores) as a `NonZero<usize>`.
+We use it both as the default `-j` value and to compute the CPU cap at `2× cores`.
+The 2× factor allows N downloads (async, I/O-bound) to overlap with N parses
+(CPU-bound in `spawn_blocking`) without oversubscription.
+
+**`#[cfg(target_os = "...")]` — conditional compilation**
+Rust's `#[cfg]` attribute controls which code compiles on which platform. Unlike C's
+`#ifdef`, this is checked by the compiler, so typos in target names are caught. We
+define three `get_available_memory()` implementations — macOS, Linux, and a fallback —
+and exactly one compiles into the final binary. The other two don't exist at all.
+
+**`std::process::Command` — safe alternative to FFI (macOS)**
+macOS exposes memory info through `sysctl`, a command-line tool that queries kernel
+parameters. We spawn it as a subprocess via `Command::new("sysctl").args(["-n", key])`
+and parse its stdout. This is slower than a direct C FFI call (~1 ms vs ~1 μs) but
+requires no `unsafe` and no C bindings. At startup (one-time cost), this is negligible.
+We query page size, free pages, speculative pages, and purgeable pages — the latter
+two are immediately reclaimable, giving a more realistic estimate than free pages alone.
+
+**`/proc/meminfo` — Linux pseudo-filesystem**
+On Linux, kernel state is exposed as text files under `/proc`. `/proc/meminfo` contains
+memory statistics including `MemAvailable`, which accounts for free pages, reclaimable
+caches, and kernel buffers. We parse it with `strip_prefix` + `trim` — standard string
+processing, no external dependencies.
+
+**Layered caps — defense in depth**
+The three caps apply sequentially, each reducing the job count if needed:
+1. CPU cap: `min(config.jobs, 2 × cores)` — prevents `spawn_blocking` oversubscription
+2. RAM cap: `min(capped_jobs, available_ram / 1 GB)` — prevents OOM in stream mode
+3. `buffer_unordered(effective_jobs)` — backpressure: a finished job frees its buffer
+   before the next one allocates
+
+This pattern — check once at startup, pick the most restrictive limit — avoids
+runtime polling overhead while covering the common failure modes (too many CPU tasks,
+too many in-memory buffers).
+
 ### What's next
 
 Analysis and visualization of the extracted metadata — correlating clearnet URLs

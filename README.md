@@ -21,11 +21,12 @@ The project was built incrementally and now features the following:
 7. **Ripgrep-style parsing strategies** — Four optimization layers selectable at runtime (`-s`)
 8. **WARC metadata extraction** — Track source URL, crawl date, and archive for each `.onion` found
 9. **In-memory streaming** — Parse from memory with `--stream` / `-m` to skip disk I/O entirely
+10. **Resource guards** — Layered concurrency caps (CPU cores, available RAM) prevent oversubscription and OOM
 
 Additional features:
 
-10. **CLI with `clap`** — Short flags (`-l`, `-j`, `-d`, `-s`, `-m`), auto `--help`, required input file
-9. **Timing** — Per-archive download/parse duration and averages in summary
+- **CLI with `clap`** — Short flags (`-l`, `-j`, `-d`, `-s`, `-m`), auto `--help`, required input file
+- **Timing** — Per-archive download/parse duration and averages in summary
 
 ## Rust Concepts Covered
 
@@ -40,6 +41,8 @@ Each step introduces new Rust fundamentals:
 - Concurrency patterns
 - Serialization with `serde` derive macros
 - In-memory I/O with `std::io::Cursor`
+- Conditional compilation with `#[cfg(target_os)]`
+- Platform-specific code (macOS `sysctl`, Linux `/proc/meminfo`)
 - SIMD-accelerated byte searching (`memchr`)
 - Memory-mapped I/O (`mmap`)
 - `unsafe` blocks and when they're justified
@@ -88,7 +91,9 @@ literal search replaces the regex engine, `zlib-ng` backend for faster gzip deco
 The `bytes` and `memchr` strategies also support `--stream` / `-m` mode, which downloads
 archives into memory and parses from a `Cursor<Vec<u8>>` instead of a file — eliminating
 all disk I/O. Incompatible strategies (`baseline`, `mmap`) fall back to disk mode with a
-warning. Memory cost: ~800 MB per archive × concurrent jobs.
+warning. Memory cost: ~800 MB per archive × concurrent jobs. Layered resource guards
+automatically cap concurrency: jobs are limited to 2× CPU cores, and in stream mode,
+further limited by available RAM (queried at startup on macOS and Linux) to prevent OOM.
 
 ## Output Format
 
