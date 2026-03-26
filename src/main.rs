@@ -73,6 +73,99 @@ fn default_jobs() -> usize {
         .unwrap_or(1)
 }
 
+/// Query available system memory on macOS.
+///
+/// ## `std::process::Command` — safe alternative to FFI
+///
+/// macOS exposes memory info through `sysctl`, a command-line tool that
+/// queries kernel parameters. We spawn it as a subprocess and parse its
+/// stdout — slower than a direct C call (~1 ms vs ~1 μs) but requires
+/// no `unsafe` and no C bindings.
+///
+/// ## Why free + speculative + purgeable?
+///
+/// macOS categorizes memory pages into several states. "Free" pages alone
+/// underestimate available memory because the OS also maintains:
+/// - **Speculative pages**: pre-fetched data that can be discarded instantly
+/// - **Purgeable pages**: data marked as reclaimable by applications
+///
+/// Adding these gives a more realistic estimate of memory available for
+/// new allocations, closer to what Activity Monitor reports.
+#[cfg(target_os = "macos")]
+fn get_available_memory() -> Option<u64> {
+    use std::process::Command;
+
+    // Helper: run `sysctl -n <key>` and parse the output as u64.
+    // Returns 0 if the key doesn't exist on this macOS version, so
+    // optional sysctl keys degrade gracefully.
+    fn sysctl_value(key: &str) -> Option<u64> {
+        let output = Command::new("sysctl")
+            .args(["-n", key])
+            .output()
+            .ok()?;
+        // If the key is unknown, sysctl exits with an error — treat as 0.
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+    }
+
+    let page_size = sysctl_value("vm.pagesize")?;
+    let free_pages = sysctl_value("vm.page_free_count")?;
+    // Speculative and purgeable pages are immediately reclaimable.
+    // These keys may not exist on all macOS versions — default to 0.
+    let speculative = sysctl_value("vm.page_speculative_count").unwrap_or(0);
+    let purgeable = sysctl_value("vm.page_purgeable_count").unwrap_or(0);
+
+    Some((free_pages + speculative + purgeable) * page_size)
+}
+
+/// Query available system memory on Linux.
+///
+/// ## `/proc/meminfo` — Linux pseudo-filesystem
+///
+/// On Linux, kernel state is exposed as text files under `/proc`. These
+/// aren't real files — the kernel generates their content on each read.
+/// `/proc/meminfo` contains memory statistics, one per line:
+///
+/// ```text
+/// MemTotal:       16384000 kB
+/// MemFree:         1234567 kB
+/// MemAvailable:    8765432 kB
+/// ...
+/// ```
+///
+/// `MemAvailable` is the most accurate measure of "how much memory can new
+/// allocations use?" — it accounts for free pages, reclaimable caches, and
+/// kernel buffers. This is what `free` and `htop` display. It's more useful
+/// than `MemFree`, which excludes cache pages the OS would happily reclaim.
+#[cfg(target_os = "linux")]
+fn get_available_memory() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            // Value is in kB — strip the "kB" suffix and convert to bytes.
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+/// Fallback for unsupported platforms — skip the memory check.
+///
+/// ## `#[cfg]` — conditional compilation
+///
+/// Rust's `#[cfg(target_os = "...")]` attribute controls which code is
+/// compiled on which platform. Unlike C's `#ifdef`, this is checked by the
+/// compiler (not a preprocessor), so typos in target names are caught.
+/// The three `get_available_memory()` implementations compile to exactly
+/// one function in the final binary — the other two don't exist at all.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_available_memory() -> Option<u64> {
+    None
+}
+
 // Parsed command-line configuration.
 //
 // Uses `clap` derive — the idiomatic Rust way to define CLI interfaces.
@@ -193,9 +286,64 @@ async fn main() {
         false
     };
 
+    // --- Cap jobs at 2× CPU cores ---
+    //
+    // Each job runs CPU-bound parsing via `spawn_blocking` (gzip decompression
+    // + search). More jobs than available threads means tasks queue up waiting
+    // for a blocking thread, adding context switching overhead without any
+    // throughput gain. We allow 2× cores to keep the pipeline full: while N
+    // archives are parsing, up to N more can be downloading (async, lightweight).
+    let cpu_cores = default_jobs();
+    let max_cpu_jobs = cpu_cores * 2;
+    let capped_jobs = if config.jobs > max_cpu_jobs {
+        eprintln!(
+            "Warning: {} jobs requested but only {} CPU cores detected. \
+             Capping to {} (2\u{00d7} cores) to avoid oversubscription.",
+            config.jobs, cpu_cores, max_cpu_jobs,
+        );
+        max_cpu_jobs
+    } else {
+        config.jobs
+    };
+
+    // --- Cap concurrent jobs based on available RAM (stream mode only) ---
+    //
+    // ## Defensive resource management
+    //
+    // In stream mode, each concurrent job holds an entire archive in memory
+    // (~800 MB–1 GB). Without a cap, a 16-core machine with 8 GB of RAM
+    // would try to hold 16 archives simultaneously — guaranteed OOM.
+    //
+    // We query available RAM once at startup and compute the maximum safe
+    // number of concurrent stream jobs. `buffer_unordered` then provides
+    // natural backpressure: when a job finishes and frees its buffer, the
+    // next one starts and allocates a new buffer.
+    let effective_jobs = if stream_enabled {
+        const MAX_ARCHIVE_SIZE: u64 = 1_073_741_824; // 1 GB worst case
+        if let Some(available) = get_available_memory() {
+            let max_jobs = (available / MAX_ARCHIVE_SIZE).max(1) as usize;
+            if max_jobs < capped_jobs {
+                eprintln!(
+                    "Warning: available RAM ({:.1} GB) limits stream jobs to {} \
+                     (requested {}). Use disk mode or free memory for more concurrency.",
+                    available as f64 / 1_073_741_824.0,
+                    max_jobs,
+                    capped_jobs,
+                );
+                max_jobs
+            } else {
+                capped_jobs
+            }
+        } else {
+            capped_jobs // Can't detect RAM — proceed with CPU-capped jobs
+        }
+    } else {
+        capped_jobs // Disk mode — no memory concern
+    };
+
     eprintln!(
         "Reading WARC paths from '{}' (limit: {}, jobs: {}, delete after: {}, strategy: {}, stream: {})",
-        config.input, limit_display, config.jobs, config.delete, strategy_name, stream_enabled
+        config.input, limit_display, effective_jobs, config.delete, strategy_name, stream_enabled
     );
 
     // --- Open and read the paths file ---
@@ -294,7 +442,7 @@ async fn main() {
         return;
     }
 
-    eprintln!("Processing {} archive(s) with {} concurrent job(s)\n", work_items.len(), config.jobs);
+    eprintln!("Processing {} archive(s) with {} concurrent job(s)\n", work_items.len(), effective_jobs);
 
     // --- Compile the .onion regex once, wrapped in Arc for sharing ---
     //
@@ -473,7 +621,7 @@ async fn main() {
                 Ok((idx, filename, local_path, ArchiveResult { onions, download_time, parse_time }))
             }
         })
-        .buffer_unordered(config.jobs);
+        .buffer_unordered(effective_jobs);
 
     // --- Collect results back on the main task ---
     //
